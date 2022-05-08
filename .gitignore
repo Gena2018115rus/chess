@@ -27,5 +27,7 @@
 
 
 Project1.o
+*.dll
+main.exe
 
-
+.vscode

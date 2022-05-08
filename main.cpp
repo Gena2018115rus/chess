@@ -7,7 +7,11 @@
 #include <numbers>
 #include <cmath>
 #include <vector>
+#include <thread>
+#include <mutex>
+#include <regex>
 #include "resource.h"
+#include "eth-lib/eth-lib.hpp"
 
 #define MAX_LOADSTRING 100
 
@@ -78,6 +82,11 @@ GLuint wolfw_texture, wolfm_texture,
        black_king_texture, white_king_texture;
 HINSTANCE hInst;
 icoord cursor;
+std::mutex g_connection2host_mtx, g_client_mtx;
+client_t *g_connection2host;
+client_ref_t *g_client;
+bool online_mode;
+std::string in_buf;
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam);
 
 HWND createWindow(HINSTANCE hInstance, int nCmdShow, HACCEL *hAccelTable)
@@ -415,25 +424,31 @@ struct rook : default_piece {
     }
 };
 
+void next_players_turn() {
+    now_playing = (piece_color)((now_playing + 1) % NUMBER_OF_COLORS);
+}
+
 struct cell {
     std::shared_ptr<default_piece> piece;
     
-    void click(icoord self_coord) {
+    bool click(icoord self_coord) {
         if (selected_piece) {
             if (selected_piece->is_can_step_here()[self_coord.y()][self_coord.x()]) {
                 piece = std::move(selected_piece);
                 if (self_coord != selected_from) {
                     piece->moved();
-                    now_playing = (piece_color)((now_playing + 1) % NUMBER_OF_COLORS);
+                    next_players_turn();
+                    return true;
                 }
             }
         } else if (piece) {
             if (piece->color != now_playing)
-                return;
+                return false;
             selected_piece = std::move(piece);
             selected_from = self_coord;
             selected_piece->show_where_can_step();
         }
+        return false;
     }
 };
 
@@ -582,7 +597,31 @@ void init_chessboard () {
     }
 }
 
-int wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLine, int nCmdShow)
+void myClickEvent(icoord ic) {
+    try {
+        if (chessboard.at(ic.y()).at(ic.x()).click(ic) && online_mode)
+        {
+            auto line = std::to_string(selected_from.x()) + '&' + std::to_string(selected_from.y()) + '&' + std::to_string(ic.x()) + '&' + std::to_string(ic.y());
+            g_client_mtx.lock();
+            if (g_client)
+            {
+                line += "\r\n";
+                g_client->write(line.data(), line.size());
+            }
+            g_client_mtx.unlock();
+            g_connection2host_mtx.lock();
+            // TODO: отлавливать отключение клиента и сервера (с двух сторон)
+            if (g_connection2host)
+            {
+                g_connection2host->write(line.data(), line.size());
+            }
+            g_connection2host_mtx.unlock();
+        }
+    } catch (const std::out_of_range &) {
+    }
+}
+
+int WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow)
 {
     SetConsoleCP(65001);
     SetConsoleOutputCP(65001);
@@ -614,6 +653,74 @@ int wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLine, int
 
     
     init_chessboard();
+    
+    
+    if (MessageBox(hWnd, L"Играть по сети?", L"Привет!", MB_YESNO) == IDYES)
+    {
+        online_mode = true;
+        static std::regex re{"(-?\\d+)&(-?\\d+)&(-?\\d+)&(-?\\d+)"};
+        if (MessageBox(hWnd, L"Быть хостом?", L"Ещё пара вопросов..", MB_YESNO) == IDYES)
+        {
+            // next_players_turn();
+            std::thread([] {
+                std::wcout << L"Запускаем сервер и ждём подключения..." << std::endl;
+                make_listener(20182)->run([](client_ref_t client) {
+                    g_client_mtx.lock();
+                    if (!g_client)
+                    {
+                        static client_ref_t s_client = std::move(client);
+                        g_client = &s_client;
+                        std::wcout << L"Клиент подключился!" << std::endl;
+                    }
+                    
+                    
+                    g_client_mtx.unlock();
+                }, [](const char *addr, const char *msg, size_t msg_sz) {
+                    wprintf(L"Пришло от %s: %.*s\n", addr, msg_sz, msg);
+                    std::string message{msg, msg + msg_sz};
+                    std::smatch m;
+                    if (std::regex_match(message, m, re)) {
+                        wprintf(L"x1 = %s; y1 = %s; x2 = %s; y2 = %s;\n", m.str(1).data(), m.str(2).data(), m.str(3).data(), m.str(4).data());
+                        myClickEvent({stoi(m[1]), stoi(m[2])});
+                        myClickEvent({stoi(m[3]), stoi(m[4])});
+                    }
+                });
+            }).detach();
+        }
+        else
+        {
+            std::thread([] {
+                // std::wstring addr;
+                // std::getline(std::wcin, addr);
+                std::wcout << L"Пытаемся подключиться к " /*<< addr */<< L" ..." << std::endl;
+                g_connection2host_mtx.lock();
+                g_connection2host = make_client("localhost", "20182");
+                g_connection2host_mtx.unlock();
+                std::wcout << L"Соединение установлено!" << std::endl;
+                g_connection2host->listen([](const char *chunk, size_t sz) {
+                    wprintf(L"Пришло: %.*s", sz, chunk);
+                    in_buf += {chunk, chunk + sz};
+                    for (;;) {
+                        auto index = in_buf.find("\r\n");
+                        if (index != (size_t)-1) {
+                            std::string line = {in_buf.begin(), in_buf.begin() + index};
+                            in_buf = {in_buf.begin() + index + 2, in_buf.end()};
+                            // обработка line
+                            std::cout << "найдено: >>>" << line << "<<<" << std::endl;
+                            std::smatch m;
+                            if (std::regex_match(line, m, re)) {
+                                wprintf(L"x1 = %s; y1 = %s; x2 = %s; y2 = %s;\n", m.str(1).data(), m.str(2).data(), m.str(3).data(), m.str(4).data());
+                                myClickEvent({stoi(m[1]), stoi(m[2])});
+                                myClickEvent({stoi(m[3]), stoi(m[4])});
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                });
+            }).detach();
+        }
+    }
     
 
     for (MSG msg = {0}; msg.message != WM_QUIT; )
@@ -727,21 +834,31 @@ void draw_circle(dcoord center, double radius) {
 
 void draw()
 {
-   
     auto [x, y, w, h] = getStartCoord();
 
     bool flag = false;
-
     for (int iy = 0; iy < 8; ++iy)
     {
         for (int ix = 0; ix < 8; ++ix)
- 
         {
-           
             if (flag ^= 1) glColor3d(1.0, 1.0, 1.0);
             else glColor3d(0.0, 0.0, 0.0);
             square_t place{x + w * ix, y - h * (iy + 1), w, h};
             glRectd(place.x, place.y, place.x + w, place.y + h);
+        }
+        flag ^= 1;
+    }
+    
+    for (int iy = 0; iy < 8; ++iy)
+    {
+        for (int ix = 0; ix < 8; ++ix)
+        {
+            square_t place;
+            if (online_mode && g_client) {
+                place = {x + w * (7 - ix), y - h * (7 - iy + 1), w, h};
+            } else {
+                place = {x + w * ix, y - h * (iy + 1), w, h};
+            }
             if (chessboard[7 - iy][ix].piece)
                 chessboard[7 - iy][ix].piece->draw(place);
             if (selected_piece && selected_piece->is_can_step_here()[7 - iy][ix]) {
@@ -749,7 +866,6 @@ void draw()
                 draw_circle({place.x + place.w / 2, place.y + place.h / 2}, 0.125);
             }
         }
-        flag ^= 1;
     }
     
     if (selected_piece) {
@@ -770,13 +886,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         break;
         case WM_LBUTTONUP:
         {
-        
-            icoord ic = getCursorCoord<icoord>();
-        	try {
-                chessboard.at(ic.y()).at(ic.x()).click(ic);
-            } catch (const std::out_of_range &) {
-                
+            if (online_mode && now_playing != (g_client ? BLACK : g_connection2host ? WHITE : NUMBER_OF_COLORS)) { // сюда бы мьютекс, чтоб уж соответствовать
+                break;
             }
+            icoord ic = getCursorCoord<icoord>();
+            if (online_mode && g_client) {
+                ic.x() = 7 - ic.x();
+                ic.y() = 7 - ic.y();
+            }
+            myClickEvent(ic);
         }
         break;
         case WM_SIZE:
